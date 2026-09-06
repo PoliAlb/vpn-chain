@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  # --- PRIMO SALTO: VPN 1 (Nodo di Ingresso) ---
+  vpn1:
+    image: dperson/openvpn-client
+    container_name: vpn1
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    security_opt:
+      - label:disable
+    volumes:
+      - ./vpn1-config:/vpn   # qui vanno il file .ovpn e le credenziali (auth.txt)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ping", "-c", "1", "1.1.1.1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # --- SECONDO SALTO: VPN 2 (Nodo di Uscita) ---
+  # Condivide lo stack di rete di vpn1: il tunnel di vpn2 si "incapsula"
+  # dentro quello di vpn1, realizzando la catena a doppio salto.
+  vpn2:
+    image: dperson/openvpn-client
+    container_name: vpn2
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    security_opt:
+      - label:disable
+    volumes:
+      - ./vpn2-config:/vpn   # file .ovpn e credenziali per il secondo hop
+    network_mode: "service:vpn1"
+    depends_on:
+      vpn1:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- TERZO CONTAINER: PROXY PYTHON ---
+  # Usa image python:3.12-alpine (leggera) e instrada tutto il traffico
+  # attraverso vpn2, che a sua volta passa per vpn1.
+  proxy_python:
+    build: ./proxy            # usa ./proxy/Dockerfile per costruire l'immagine
+    container_name: proxy_python
+    working_dir: /app
+    volumes:
+      - ./proxy:/app          # qui metti proxy.py (requirements.txt resta nel build)
+    network_mode: "service:vpn2"
+    depends_on:
+      - vpn2
+    restart: unless-stopped
