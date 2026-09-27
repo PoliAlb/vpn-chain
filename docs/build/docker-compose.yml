@@ -3,7 +3,7 @@ version: '3.8'
 services:
   # --- PRIMO SALTO: VPN 1 (Nodo di Ingresso) ---
   vpn1:
-    image: dperson/openvpn-client
+    image: avpnusr/docker-openvpn:latest
     container_name: vpn1
     cap_add:
       - NET_ADMIN
@@ -24,7 +24,7 @@ services:
   # Condivide lo stack di rete di vpn1: il tunnel di vpn2 si "incapsula"
   # dentro quello di vpn1, realizzando la catena a doppio salto.
   vpn2:
-    image: dperson/openvpn-client
+    image: avpnusr/docker-openvpn:latest
     container_name: vpn2
     cap_add:
       - NET_ADMIN
@@ -44,11 +44,11 @@ services:
   # Usa image python:3.12-alpine (leggera) e instrada tutto il traffico
   # attraverso vpn2, che a sua volta passa per vpn1.
   proxy_python:
-    build: ./proxy            # usa ./proxy/Dockerfile per costruire l'immagine
+    build: ./proxy
     container_name: proxy_python
     working_dir: /app
     volumes:
-      - ./proxy:/app          # qui metti proxy.py (requirements.txt resta nel build)
+      - ./proxy:/app
     network_mode: "service:vpn2"
     depends_on:
       - vpn2
