@@ -1,6 +1,12 @@
 import asyncio
-import struct
 import socket
+import struct
+
+LISTEN_HOST = '0.0.0.0'
+LISTEN_PORT = 8080
+
+REPLY_OK = b'\x00\x5a\x00\x00\x00\x00\x00\x00'
+REPLY_FAIL = b'\x00\x5b\x00\x00\x00\x00\x00\x00'
 
 
 async def inoltra(reader, writer):
@@ -9,54 +15,65 @@ async def inoltra(reader, writer):
         while True:
             chunk = await reader.read(4096)
             if not chunk:
-                break  # il socket è stato chiuso dall'altro lato
+                break
             writer.write(chunk)
             await writer.drain()
     except (ConnectionResetError, BrokenPipeError, OSError) as e:
         print(f"Connessione interrotta durante l'inoltro: {e}")
     finally:
-        # Punto 5: chiudi il lato di scrittura quando questa direzione finisce,
-        # cosi' l'altra direzione se ne accorge (il suo .read() torna b'') e si chiude a sua volta.
         try:
             writer.close()
             await writer.wait_closed()
         except OSError:
-            pass  # può essere già stato chiuso dall'altra direzione
+            pass
 
 
 async def gestisci_connessione(local_reader, local_writer):
     remote_writer = None
     try:
+        # Header SOCKS4: VN(1) CD(1) DSTPORT(2) DSTIP(4)
         data = await local_reader.readexactly(8)
         version, command, port, ip_bytes = struct.unpack('!BBH4s', data)
-        remote_ip = socket.inet_ntoa(ip_bytes)
 
-        # 3. Controlla che versione sia 4 e comando sia 1
+        # FIX 1: dopo l'header ci sono USERID (lunghezza variabile) + NUL.
+        # Il codice originale non li leggeva: il NUL finiva nel flusso dati
+        # e il server remoto vedeva "\x00GET ..." -> 501 / connessione rotta.
+        await asyncio.wait_for(local_reader.readuntil(b'\x00'), timeout=10)
+
         if version != 4 or command != 1:
-            local_writer.write(b'\x00\x5b\x00\x00\x00\x00\x00\x00')
+            local_writer.write(REPLY_FAIL)
             await local_writer.drain()
             return
 
-        # 5. Apri la connessione verso l'esterno (Punto 6: gestione errore)
+        # FIX 2: SOCKS4a. Se l'IP è 0.0.0.x (x != 0) il client manda il
+        # NOME HOST dopo lo userid, e la risoluzione DNS la facciamo qui,
+        # DENTRO la VPN (niente DNS leak lato client).
+        if ip_bytes[:3] == b'\x00\x00\x00' and ip_bytes[3] != 0:
+            raw = await asyncio.wait_for(local_reader.readuntil(b'\x00'), timeout=10)
+            remote_host = raw[:-1].decode('ascii', errors='replace')
+        else:
+            remote_host = socket.inet_ntoa(ip_bytes)
+
         try:
-            remote_reader, remote_writer = await asyncio.open_connection(remote_ip, port)
+            remote_reader, remote_writer = await asyncio.wait_for(
+                asyncio.open_connection(remote_host, port), timeout=15)
         except (OSError, asyncio.TimeoutError) as e:
-            print(f"Connessione remota fallita verso {remote_ip}:{port} -> {e}")
-            local_writer.write(b'\x00\x5b\x00\x00\x00\x00\x00\x00')  # richiesta rifiutata/fallita
+            print(f"Connessione remota fallita verso {remote_host}:{port} -> {e!r}")
+            local_writer.write(REPLY_FAIL)
             await local_writer.drain()
             return
 
-        # 6. Invia la risposta di successo al client
-        local_writer.write(b'\x00\x5a\x00\x00\x00\x00\x00\x00')
+        local_writer.write(REPLY_OK)
         await local_writer.drain()
 
-        # 7. Avvia i due task contemporanei
-        task1 = asyncio.create_task(inoltra(local_reader, remote_writer))   # client -> remoto
-        task2 = asyncio.create_task(inoltra(remote_reader, local_writer))  # remoto -> client
+        task1 = asyncio.create_task(inoltra(local_reader, remote_writer))
+        task2 = asyncio.create_task(inoltra(remote_reader, local_writer))
         await asyncio.gather(task1, task2, return_exceptions=True)
 
+    except (asyncio.IncompleteReadError, asyncio.TimeoutError, asyncio.LimitOverrunError):
+        pass  # client che chiude/handshake incompleto: normale, niente rumore
     except Exception as e:
-        print(f"Errore: {e}")
+        print(f"Errore: {e!r}")
     finally:
         local_writer.close()
         if remote_writer is not None:
@@ -64,7 +81,8 @@ async def gestisci_connessione(local_reader, local_writer):
 
 
 async def main():
-    server = await asyncio.start_server(gestisci_connessione, '0.0.0.0', 8080)
+    server = await asyncio.start_server(gestisci_connessione, LISTEN_HOST, LISTEN_PORT)
+    print(f"SOCKS4/4a in ascolto su {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
     async with server:
         await server.serve_forever()
 

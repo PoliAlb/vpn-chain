@@ -1,55 +1,60 @@
-version: '3.8'
-
 services:
-  # --- PRIMO SALTO: VPN 1 (Nodo di Ingresso) ---
+  # --- HOP 1 ---
   vpn1:
     image: avpnusr/docker-openvpn:latest
     container_name: vpn1
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun
-    security_opt:
-      - label:disable
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun]
+    security_opt: ["label:disable"]
     volumes:
-      - ./vpn1-config:/vpn   # qui vanno il file .ovpn e le credenziali (auth.txt)
+      - ./vpn1-config:/vpn
+    # La porta del proxy va pubblicata QUI: vpn2 e proxy_python usano il netns
+    # di vpn1 e non possono avere "ports:" proprie.
+    # 127.0.0.1 = non esporre un proxy aperto alla tua LAN.
+    ports:
+      - "127.0.0.1:8080:8080"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "ping", "-c", "1", "1.1.1.1"]
+      test: ["CMD-SHELL", "ip addr show tun0 | grep -q inet && ping -c1 -W5 1.1.1.1"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 30s
 
-  # --- SECONDO SALTO: VPN 2 (Nodo di Uscita) ---
-  # Condivide lo stack di rete di vpn1: il tunnel di vpn2 si "incapsula"
-  # dentro quello di vpn1, realizzando la catena a doppio salto.
+  # --- HOP 2 (annidato in vpn1) ---
   vpn2:
     image: avpnusr/docker-openvpn:latest
     container_name: vpn2
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun
-    security_opt:
-      - label:disable
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun]
+    security_opt: ["label:disable"]
+    environment:
+      - DEFAULT_GATEWAY=false   # l'instradamento lo fa la conf (route /2)
     volumes:
-      - ./vpn2-config:/vpn   # file .ovpn e credenziali per il secondo hop
+      - ./vpn2-config:/vpn
     network_mode: "service:vpn1"
     depends_on:
       vpn1:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      # il ping qui non servirebbe: il netns e' lo stesso di vpn1.
+      # Verifichiamo invece che tun1 esista e abbia un IP.
+      test: ["CMD-SHELL", "ip addr show tun1 | grep -q inet"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
 
-  # --- TERZO CONTAINER: PROXY PYTHON ---
-  # Usa image python:3.12-alpine (leggera) e instrada tutto il traffico
-  # attraverso vpn2, che a sua volta passa per vpn1.
+  # --- Proxy SOCKS4/4a ---
   proxy_python:
     build: ./proxy
     container_name: proxy_python
     working_dir: /app
     volumes:
       - ./proxy:/app
-    network_mode: "service:vpn2"
+    network_mode: "service:vpn1"   # stesso netns; le rotte di vpn2 valgono anche qui
     depends_on:
-      - vpn2
+      vpn2:
+        condition: service_healthy
     restart: unless-stopped
