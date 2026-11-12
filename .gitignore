@@ -1,4 +1,6 @@
 #configurazione delle vpn
-docs/build/vpn1-config/*
+./vpn1-config/*.conf
 
-docs/build/vpn2-config/*
+./vpn2-config/*.conf
+
+riseup-ovpn.conf

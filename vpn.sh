@@ -1,17 +1,4 @@
 #!/usr/bin/env bash
-#
-# vpn.sh - tutto in uno: prepara le conf, avvia i container, verifica il doppio hop.
-#
-# Uso (da qualunque cartella: lavora nella cartella in cui si trova lo script):
-#   ./vpn.sh [up] [--force]   prepara + docker compose up + attesa + verifica   (default)
-#   ./vpn.sh prepare [--force]  solo conf (rigenera se mancano o il cert sta per scadere)
-#   ./vpn.sh check            solo verifica di un setup gia' avviato
-#   ./vpn.sh down             docker compose down
-#   ./vpn.sh logs [servizio]  segue i log (vpn1, vpn2, proxy_python)
-#
-# Variabili opzionali: GEN_OPTS (default "--no-ipv6"; "" per abilitare IPv6), PROXY_PORT (8080),
-#                      CERT_MIN_DAYS (3), WAIT_SECS (240)
-#
 set -u
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -330,16 +317,26 @@ pull-filter ignore "dhcp-option"
 pull-filter ignore "block-outside-dns"
 script-security 2
 up /vpn/hop2-up.sh
-route 0.0.0.0   192.0.0.0 vpn_gateway
-route 64.0.0.0  192.0.0.0 vpn_gateway
-route 128.0.0.0 192.0.0.0 vpn_gateway
-route 192.0.0.0 192.0.0.0 vpn_gateway
+# Le rotte /2 verso tun1 le aggiunge hop2-up.sh con "dev tun1" esplicito
+# (con "via <gateway>" il kernel le attaccherebbe a tun0: stesso 10.41.0.1).
 EOT
 
     cat > "$BUILD_DIR/vpn2-config/hop2-up.sh" <<'EOT'
 #!/bin/sh
-# Il server di vpn2 deve restare raggiungibile via tun0 (vpn1), non via tun1.
+# Eseguito da OpenVPN (hop 2) subito dopo la creazione di tun1.
+set -e
+DEV="${dev:-tun1}"
+
+# 1) il server di vpn2 deve restare raggiungibile via tun0 (= dentro vpn1)
 ip route replace "${trusted_ip}/32" dev tun0
+
+# 2) tutto il resto esce da tun1. Quattro /2 sono piu' specifiche dei /1 di
+#    vpn1, quindi vincono. "dev" ESPLICITO: vpn1 e vpn2 hanno entrambi gateway
+#    10.41.0.1 sulla stessa sottorete, e con "via 10.41.0.1" il kernel
+#    sceglierebbe tun0 invece di tun1.
+for net in 0.0.0.0/2 64.0.0.0/2 128.0.0.0/2 192.0.0.0/2; do
+    ip route replace "$net" dev "$DEV"
+done
 EOT
     chmod +x "$BUILD_DIR/vpn2-config/hop2-up.sh"
 }
@@ -350,7 +347,15 @@ cmd_prepare() {
     local gen_conf="$BUILD_DIR/riseup-ovpn.conf"
     local hop1="$BUILD_DIR/vpn1-config/riseup-ovpn.conf"
 
-    if [ "$force" != "--force" ] && cert_ok "$hop1" && [ -f "$BUILD_DIR/vpn2-config/riseup-ovpn.conf" ]; then
+    local hop2="$BUILD_DIR/vpn2-config/riseup-ovpn.conf"
+    # conf vpn2 di una versione precedente (rotte "via vpn_gateway")? rifai solo lo split
+    if [ -f "$hop2" ] && grep -q 'vpn_gateway' "$hop2" && [ "$force" != "--force" ] && cert_ok "$gen_conf"; then
+        info "Conf hop 2 obsoleta: rifaccio solo la divisione (stesso certificato, niente rete)."
+        split_hops "$gen_conf"
+        pass "Conf hop 2 aggiornata."
+        return 0
+    fi
+    if [ "$force" != "--force" ] && cert_ok "$hop1" && [ -f "$hop2" ] && ! grep -q 'vpn_gateway' "$hop2"; then
         pass "Conf esistenti con certificato valido (>= ${CERT_MIN_DAYS} giorni): non rigenero. (--force per forzare)"
         return 0
     fi
@@ -472,8 +477,8 @@ wait_healthy() {
 
 cmd_up() {
     cmd_prepare "${1:-}"
-    info "docker compose up -d --build"
-    ( cd "$BUILD_DIR" && compose up -d --build ) || die "docker compose up e' fallito."
+    info "docker compose up -d --build --force-recreate"
+    ( cd "$BUILD_DIR" && compose up -d --build --force-recreate ) || die "docker compose up e' fallito."
     wait_healthy "$VPN1" || exit 1
     wait_healthy "$VPN2" || exit 1
     sleep 3
