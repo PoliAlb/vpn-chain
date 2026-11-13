@@ -5,7 +5,7 @@ services:
     container_name: vpn1
     cap_add: [NET_ADMIN]
     devices: [/dev/net/tun]
-    security_opt: ["label:disable"]
+    security_opt: ["label:disable", "no-new-privileges:true"]
     volumes:
       - ./vpn1-config:/vpn
     # La porta del proxy va pubblicata QUI: vpn2 e proxy_python usano il netns
@@ -27,7 +27,7 @@ services:
     container_name: vpn2
     cap_add: [NET_ADMIN]
     devices: [/dev/net/tun]
-    security_opt: ["label:disable"]
+    security_opt: ["label:disable", "no-new-privileges:true"]
     environment:
       - DEFAULT_GATEWAY=false   # l'instradamento lo fa la conf (route /2)
     volumes:
@@ -54,6 +54,14 @@ services:
     volumes:
       - ./proxy:/app
     network_mode: "service:vpn1"   # stesso netns; le rotte di vpn2 valgono anche qui
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]              # il proxy non ha bisogno di nessuna capability
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8080), 3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     depends_on:
       vpn2:
         condition: service_healthy
