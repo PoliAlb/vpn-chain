@@ -4,7 +4,7 @@ set -u
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Cartella con docker-compose.yml, proxy/ e vpn{1,2}-config/: quella dello script
-# (se ci sta gia' un compose o non c'e' altro), oppure ./docs/build se esiste.
+# se ci sta il compose, altrimenti ./docs/build se esiste.
 if [ -f "$SELF_DIR/docker-compose.yml" ] || [ ! -f "$SELF_DIR/docs/build/docker-compose.yml" ]; then
     BUILD_DIR="$SELF_DIR"
 else
@@ -39,185 +39,14 @@ cert_ok() {
         | openssl x509 -noout -checkend $((CERT_MIN_DAYS * 86400)) >/dev/null 2>&1
 }
 
-# Se mancano compose/proxy nella cartella, li crea: lo script e' autosufficiente.
-ensure_files() {
-    mkdir -p "$BUILD_DIR/proxy"
-    if [ ! -f "$BUILD_DIR/docker-compose.yml" ]; then
-        info "Creo docker-compose.yml"
-        cat > "$BUILD_DIR/docker-compose.yml" <<'EOF_COMPOSE'
-services:
-  # --- HOP 1 ---
-  vpn1:
-    image: avpnusr/docker-openvpn:latest
-    container_name: vpn1
-    cap_add: [NET_ADMIN]
-    devices: [/dev/net/tun]
-    security_opt: ["label:disable"]
-    volumes:
-      - ./vpn1-config:/vpn
-    # La porta del proxy va pubblicata QUI: vpn2 e proxy_python usano il netns
-    # di vpn1 e non possono avere "ports:" proprie.
-    # 127.0.0.1 = non esporre un proxy aperto alla tua LAN.
-    ports:
-      - "127.0.0.1:8080:8080"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "ip addr show tun0 | grep -q inet && ping -c1 -W5 1.1.1.1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
-  # --- HOP 2 (annidato in vpn1) ---
-  vpn2:
-    image: avpnusr/docker-openvpn:latest
-    container_name: vpn2
-    cap_add: [NET_ADMIN]
-    devices: [/dev/net/tun]
-    security_opt: ["label:disable"]
-    environment:
-      - DEFAULT_GATEWAY=false   # l'instradamento lo fa la conf (route /2)
-    volumes:
-      - ./vpn2-config:/vpn
-    network_mode: "service:vpn1"
-    depends_on:
-      vpn1:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      # il ping qui non servirebbe: il netns e' lo stesso di vpn1.
-      # Verifichiamo invece che tun1 esista e abbia un IP.
-      test: ["CMD-SHELL", "ip addr show tun1 | grep -q inet"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 45s
-
-  # --- Proxy SOCKS4/4a ---
-  proxy_python:
-    build: ./proxy
-    container_name: proxy_python
-    working_dir: /app
-    volumes:
-      - ./proxy:/app
-    network_mode: "service:vpn1"   # stesso netns; le rotte di vpn2 valgono anche qui
-    depends_on:
-      vpn2:
-        condition: service_healthy
-    restart: unless-stopped
-EOF_COMPOSE
-    fi
-    if [ ! -f "$BUILD_DIR/proxy/Dockerfile" ]; then
-        info "Creo proxy/Dockerfile"
-        cat > "$BUILD_DIR/proxy/Dockerfile" <<'EOF_DOCKERFILE'
-FROM python:3.12-alpine
-
-WORKDIR /app
-
-RUN apk add --no-cache curl
-
-# Il codice vero e proprio arriva tramite volume in docker-compose.yml,
-# non serve un COPY qui per proxy.py (resta modificabile senza rebuild).
-
-CMD ["python", "proxy.py"]
-EOF_DOCKERFILE
-    fi
-    if [ ! -f "$BUILD_DIR/proxy/proxy.py" ]; then
-        info "Creo proxy/proxy.py"
-        cat > "$BUILD_DIR/proxy/proxy.py" <<'EOF_PROXY'
-import asyncio
-import socket
-import struct
-
-LISTEN_HOST = '0.0.0.0'
-LISTEN_PORT = 8080
-
-REPLY_OK = b'\x00\x5a\x00\x00\x00\x00\x00\x00'
-REPLY_FAIL = b'\x00\x5b\x00\x00\x00\x00\x00\x00'
-
-
-async def inoltra(reader, writer):
-    """Sposta i byte da 'reader' a 'writer' finché una delle due parti chiude."""
-    try:
-        while True:
-            chunk = await reader.read(4096)
-            if not chunk:
-                break
-            writer.write(chunk)
-            await writer.drain()
-    except (ConnectionResetError, BrokenPipeError, OSError) as e:
-        print(f"Connessione interrotta durante l'inoltro: {e}")
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except OSError:
-            pass
-
-
-async def gestisci_connessione(local_reader, local_writer):
-    remote_writer = None
-    try:
-        # Header SOCKS4: VN(1) CD(1) DSTPORT(2) DSTIP(4)
-        data = await local_reader.readexactly(8)
-        version, command, port, ip_bytes = struct.unpack('!BBH4s', data)
-
-        # FIX 1: dopo l'header ci sono USERID (lunghezza variabile) + NUL.
-        # Il codice originale non li leggeva: il NUL finiva nel flusso dati
-        # e il server remoto vedeva "\x00GET ..." -> 501 / connessione rotta.
-        await asyncio.wait_for(local_reader.readuntil(b'\x00'), timeout=10)
-
-        if version != 4 or command != 1:
-            local_writer.write(REPLY_FAIL)
-            await local_writer.drain()
-            return
-
-        # FIX 2: SOCKS4a. Se l'IP è 0.0.0.x (x != 0) il client manda il
-        # NOME HOST dopo lo userid, e la risoluzione DNS la facciamo qui,
-        # DENTRO la VPN (niente DNS leak lato client).
-        if ip_bytes[:3] == b'\x00\x00\x00' and ip_bytes[3] != 0:
-            raw = await asyncio.wait_for(local_reader.readuntil(b'\x00'), timeout=10)
-            remote_host = raw[:-1].decode('ascii', errors='replace')
-        else:
-            remote_host = socket.inet_ntoa(ip_bytes)
-
-        try:
-            remote_reader, remote_writer = await asyncio.wait_for(
-                asyncio.open_connection(remote_host, port), timeout=15)
-        except (OSError, asyncio.TimeoutError) as e:
-            print(f"Connessione remota fallita verso {remote_host}:{port} -> {e!r}")
-            local_writer.write(REPLY_FAIL)
-            await local_writer.drain()
-            return
-
-        local_writer.write(REPLY_OK)
-        await local_writer.drain()
-
-        task1 = asyncio.create_task(inoltra(local_reader, remote_writer))
-        task2 = asyncio.create_task(inoltra(remote_reader, local_writer))
-        await asyncio.gather(task1, task2, return_exceptions=True)
-
-    except (asyncio.IncompleteReadError, asyncio.TimeoutError, asyncio.LimitOverrunError):
-        pass  # client che chiude/handshake incompleto: normale, niente rumore
-    except Exception as e:
-        print(f"Errore: {e!r}")
-    finally:
-        local_writer.close()
-        if remote_writer is not None:
-            remote_writer.close()
-
-
-async def main():
-    server = await asyncio.start_server(gestisci_connessione, LISTEN_HOST, LISTEN_PORT)
-    print(f"SOCKS4/4a in ascolto su {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
-    async with server:
-        await server.serve_forever()
-
-
-if __name__ == '__main__':
-    asyncio.run(main())
-EOF_PROXY
-    fi
+# docker-compose.yml, proxy/ e vpn2-config/hop2-up.sh devono esistere accanto allo script
+# (vpn.sh non li crea ne' li modifica).
+require_files() {
+    local f missing=0
+    for f in docker-compose.yml proxy/Dockerfile proxy/proxy.py vpn2-config/hop2-up.sh; do
+        [ -f "$BUILD_DIR/$f" ] || { echo -e "${RED}[ERRORE]${NC} Manca $BUILD_DIR/$f" >&2; missing=1; }
+    done
+    [ "$missing" -eq 0 ] || die "Servono accanto a vpn.sh (o in docs/build/): docker-compose.yml, proxy/ e vpn2-config/hop2-up.sh."
 }
 
 # Equivalente integrato di generate.sh (RiseupVPN-OpenVPN): scarica certificato,
@@ -316,34 +145,15 @@ pull-filter ignore "redirect-gateway"
 pull-filter ignore "dhcp-option"
 pull-filter ignore "block-outside-dns"
 script-security 2
-up /vpn/hop2-up.sh
+up "/bin/sh /vpn/hop2-up.sh"
 # Le rotte /2 verso tun1 le aggiunge hop2-up.sh con "dev tun1" esplicito
 # (con "via <gateway>" il kernel le attaccherebbe a tun0: stesso 10.41.0.1).
 EOT
-
-    cat > "$BUILD_DIR/vpn2-config/hop2-up.sh" <<'EOT'
-#!/bin/sh
-# Eseguito da OpenVPN (hop 2) subito dopo la creazione di tun1.
-set -e
-DEV="${dev:-tun1}"
-
-# 1) il server di vpn2 deve restare raggiungibile via tun0 (= dentro vpn1)
-ip route replace "${trusted_ip}/32" dev tun0
-
-# 2) tutto il resto esce da tun1. Quattro /2 sono piu' specifiche dei /1 di
-#    vpn1, quindi vincono. "dev" ESPLICITO: vpn1 e vpn2 hanno entrambi gateway
-#    10.41.0.1 sulla stessa sottorete, e con "via 10.41.0.1" il kernel
-#    sceglierebbe tun0 invece di tun1.
-for net in 0.0.0.0/2 64.0.0.0/2 128.0.0.0/2 192.0.0.0/2; do
-    ip route replace "$net" dev "$DEV"
-done
-EOT
-    chmod +x "$BUILD_DIR/vpn2-config/hop2-up.sh"
 }
 
 cmd_prepare() {
     local force="${1:-}"
-    ensure_files
+    require_files
     local gen_conf="$BUILD_DIR/riseup-ovpn.conf"
     local hop1="$BUILD_DIR/vpn1-config/riseup-ovpn.conf"
 
