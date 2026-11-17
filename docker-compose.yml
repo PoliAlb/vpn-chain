@@ -3,9 +3,13 @@ services:
   vpn1:
     image: avpnusr/docker-openvpn:latest
     container_name: vpn1
+    cap_drop: [ALL]
     cap_add: [NET_ADMIN]
     devices: [/dev/net/tun]
     security_opt: ["label:disable", "no-new-privileges:true"]
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
     volumes:
       - ./vpn1-config:/vpn
     # La porta del proxy va pubblicata QUI: vpn2 e proxy_python usano il netns
@@ -25,6 +29,7 @@ services:
   vpn2:
     image: avpnusr/docker-openvpn:latest
     container_name: vpn2
+    cap_drop: [ALL]
     cap_add: [NET_ADMIN]
     devices: [/dev/net/tun]
     security_opt: ["label:disable", "no-new-privileges:true"]
@@ -52,7 +57,7 @@ services:
     container_name: proxy_python
     working_dir: /app
     volumes:
-      - ./proxy:/app
+      - ./proxy:/app:ro
     network_mode: "service:vpn1"   # stesso netns; le rotte di vpn2 valgono anche qui
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]              # il proxy non ha bisogno di nessuna capability
